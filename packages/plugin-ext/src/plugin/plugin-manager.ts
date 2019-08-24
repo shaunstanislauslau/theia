@@ -191,7 +191,8 @@ export class PluginManagerExtImpl implements PluginManagerExt, PluginManager {
         if (!loading) {
             loading = (async () => {
                 if (plugin.rawModel.extensionDependencies) {
-                    for (const dependencyId of plugin.rawModel.extensionDependencies) {
+                    for (let dependencyId of plugin.rawModel.extensionDependencies) {
+                        dependencyId = dependencyId.toLowerCase();
                         const dependency = this.registry.get(dependencyId);
                         if (dependency) {
                             await this.loadPlugin(dependency, configStorage, visited);
