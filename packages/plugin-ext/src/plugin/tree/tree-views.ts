@@ -18,9 +18,15 @@
 
 import * as path from 'path';
 import URI from 'vscode-uri';
-import { TreeDataProvider, TreeView, TreeViewExpansionEvent, TreeItem2, TreeItemLabel } from '@theia/plugin';
+import {
+    TreeDataProvider, TreeView, TreeViewExpansionEvent, TreeItem2, TreeItemLabel,
+    TreeViewSelectionChangeEvent, TreeViewVisibilityChangeEvent
+} from '@theia/plugin';
+// TODO: extract `@theia/util` for event, disposable, cancellation and common types
+// don't use @theia/core directly from plugin host
 import { Emitter } from '@theia/core/lib/common/event';
-import { Disposable, ThemeIcon } from '../types-impl';
+import { Disposable, DisposableCollection } from '@theia/core/lib/common/disposable';
+import { Disposable as PluginDisposable, ThemeIcon } from '../types-impl';
 import { Plugin, PLUGIN_RPC_CONTEXT, TreeViewsExt, TreeViewsMain, TreeViewItem } from '../../common/plugin-api-rpc';
 import { RPCProtocol } from '../../common/rpc-protocol';
 import { CommandRegistryImpl } from '../command-registry';
@@ -47,10 +53,10 @@ export class TreeViewsExtImpl implements TreeViewsExt {
         });
     }
 
-    registerTreeDataProvider<T>(plugin: Plugin, treeViewId: string, treeDataProvider: TreeDataProvider<T>): Disposable {
+    registerTreeDataProvider<T>(plugin: Plugin, treeViewId: string, treeDataProvider: TreeDataProvider<T>): PluginDisposable {
         const treeView = this.createTreeView(plugin, treeViewId, { treeDataProvider });
 
-        return Disposable.create(() => {
+        return PluginDisposable.create(() => {
             this.treeViews.delete(treeViewId);
             treeView.dispose();
         });
@@ -77,7 +83,18 @@ export class TreeViewsExtImpl implements TreeViewsExt {
             get selection() {
                 return treeView.selectedElements;
             },
-
+            // tslint:disable-next-line:typedef
+            get onDidChangeSelection() {
+                return treeView.onDidChangeSelection;
+            },
+            // tslint:disable-next-line:typedef
+            get visible() {
+                return treeView.visible;
+            },
+            // tslint:disable-next-line:typedef
+            get onDidChangeVisibility() {
+                return treeView.onDidChangeVisibility;
+            },
             reveal: (element: T, selectionOptions: { select?: boolean }): Thenable<void> =>
                 treeView.reveal(element, selectionOptions),
 
@@ -110,20 +127,46 @@ export class TreeViewsExtImpl implements TreeViewsExt {
         }
     }
 
+    async $setSelection(treeViewId: string, treeItemIds: string[]): Promise<void> {
+        const treeView = this.treeViews.get(treeViewId);
+        if (!treeView) {
+            throw new Error('No tree view with id' + treeViewId);
+        }
+        treeView.setSelection(treeItemIds);
+    }
+
+    async $setVisible(treeViewId: string, isVisible: boolean): Promise<void> {
+        const treeView = this.treeViews.get(treeViewId);
+        if (!treeView) {
+            throw new Error('No tree view with id' + treeViewId);
+        }
+        treeView.setVisible(isVisible);
+    }
+
 }
 
-class TreeViewExtImpl<T> extends Disposable {
+class TreeViewExtImpl<T> implements Disposable {
 
-    private onDidExpandElementEmitter: Emitter<TreeViewExpansionEvent<T>> = new Emitter<TreeViewExpansionEvent<T>>();
-    public readonly onDidExpandElement = this.onDidExpandElementEmitter.event;
+    private readonly onDidExpandElementEmitter = new Emitter<TreeViewExpansionEvent<T>>();
+    readonly onDidExpandElement = this.onDidExpandElementEmitter.event;
 
-    private onDidCollapseElementEmitter: Emitter<TreeViewExpansionEvent<T>> = new Emitter<TreeViewExpansionEvent<T>>();
-    public readonly onDidCollapseElement = this.onDidCollapseElementEmitter.event;
+    private readonly onDidCollapseElementEmitter = new Emitter<TreeViewExpansionEvent<T>>();
+    readonly onDidCollapseElement = this.onDidCollapseElementEmitter.event;
 
-    private selection: T[] = [];
-    get selectedElements(): T[] { return this.selection; }
+    private readonly onDidChangeSelectionEmitter = new Emitter<TreeViewSelectionChangeEvent<T>>();
+    readonly onDidChangeSelection = this.onDidChangeSelectionEmitter.event;
+
+    private readonly onDidChangeVisibilityEmitter = new Emitter<TreeViewVisibilityChangeEvent>();
+    readonly onDidChangeVisibility = this.onDidChangeVisibilityEmitter.event;
 
     private cache: Map<string, T> = new Map<string, T>();
+
+    private readonly toDispose = new DisposableCollection(
+        this.onDidExpandElementEmitter,
+        this.onDidCollapseElementEmitter,
+        this.onDidChangeSelectionEmitter,
+        this.onDidChangeVisibilityEmitter
+    );
 
     constructor(
         private plugin: Plugin,
@@ -131,17 +174,18 @@ class TreeViewExtImpl<T> extends Disposable {
         private treeDataProvider: TreeDataProvider<T>,
         private proxy: TreeViewsMain) {
 
-        super(() => {
-            proxy.$unregisterTreeDataProvider(treeViewId);
-        });
-
         proxy.$registerTreeDataProvider(treeViewId);
+        this.toDispose.push(Disposable.create(() => this.proxy.$unregisterTreeDataProvider(treeViewId)));
 
         if (treeDataProvider.onDidChangeTreeData) {
             treeDataProvider.onDidChangeTreeData((e: T) => {
                 proxy.$refresh(treeViewId);
             });
         }
+    }
+
+    dispose(): void {
+        this.toDispose.dispose();
     }
 
     async reveal(element: T, selectionOptions?: { select?: boolean }): Promise<void> {
@@ -291,6 +335,48 @@ class TreeViewExtImpl<T> extends Disposable {
             this.onDidCollapseElementEmitter.fire({
                 element: cachedElement
             });
+        }
+    }
+
+    private selectedItemIds = new Set<string>();
+    get selectedElements(): T[] {
+        const items: T[] = [];
+        for (const id of this.selectedItemIds) {
+            const item = this.getTreeItem(id);
+            if (item) {
+                items.push(item);
+            }
+        }
+        return items;
+    }
+
+    setSelection(selectedItemIds: string[]): void {
+        const toDelete = new Set<string>(this.selectedItemIds);
+        for (const id of this.selectedItemIds) {
+            toDelete.delete(id);
+            if (!this.selectedItemIds.has(id)) {
+                this.doSetSelection(selectedItemIds);
+                return;
+            }
+        }
+        if (toDelete.size) {
+            this.doSetSelection(selectedItemIds);
+        }
+    }
+    protected doSetSelection(selectedItemIts: string[]): void {
+        this.selectedItemIds = new Set(selectedItemIts);
+        this.onDidChangeSelectionEmitter.fire(Object.freeze({ selection: this.selectedElements }));
+    }
+
+    private _visible = false;
+    get visible(): boolean {
+        return this._visible;
+    }
+
+    setVisible(visible: boolean): void {
+        if (visible !== this._visible) {
+            this._visible = visible;
+            this.onDidChangeVisibilityEmitter.fire(Object.freeze({ visible: this._visible }));
         }
     }
 
